@@ -2431,6 +2431,8 @@ func TestJetStreamClusterRaceOnRAFTCreate(t *testing.T) {
 		t.Fatalf("Error creating stream: %v", err)
 	}
 
+	c.waitOnStreamLeader(globalAccountName, "TEST")
+
 	js, err = nc.JetStream(nats.MaxWait(2 * time.Second))
 	if err != nil {
 		t.Fatal(err)
@@ -2440,12 +2442,12 @@ func TestJetStreamClusterRaceOnRAFTCreate(t *testing.T) {
 	wg := sync.WaitGroup{}
 	wg.Add(size)
 	for i := 0; i < size; i++ {
-		go func(i int) {
+		go func() {
 			defer wg.Done()
-			if _, err := js.PullSubscribe("foo", "shared"); err != nil {
-				t.Errorf("Unexpected error on %v: %v", i, err)
-			}
-		}(i)
+			// We don't care about possible failures here, we just want
+			// parallel creation of a consumer.
+			js.PullSubscribe("foo", "shared")
+		}()
 	}
 	wg.Wait()
 }
@@ -3235,86 +3237,6 @@ func TestJetStreamClusterStreamUpdateSyncBug(t *testing.T) {
 	if !reflect.DeepEqual(cloneState, leaderState) {
 		t.Fatalf("States do not match: %+v vs %+v", cloneState, leaderState)
 	}
-}
-
-func TestJetStreamClusterStreamUpdateMissingBeginning(t *testing.T) {
-	c := createJetStreamClusterExplicit(t, "R3S", 3)
-	defer c.shutdown()
-
-	// Client based API
-	s := c.randomServer()
-	nc, js := jsClientConnect(t, s)
-	defer nc.Close()
-
-	cfg := &nats.StreamConfig{
-		Name:     "TEST",
-		Subjects: []string{"foo"},
-		Replicas: 3,
-	}
-	if _, err := js.AddStream(cfg); err != nil {
-		t.Fatalf("Unexpected error: %v", err)
-	}
-
-	msg, toSend := []byte("OK"), 100
-	for i := 0; i < toSend; i++ {
-		if _, err := js.PublishAsync("foo", msg); err != nil {
-			t.Fatalf("Unexpected publish error: %v", err)
-		}
-	}
-	select {
-	case <-js.PublishAsyncComplete():
-	case <-time.After(5 * time.Second):
-		t.Fatalf("Did not receive completion signal")
-	}
-
-	nsl := c.randomNonStreamLeader("$G", "TEST")
-	// Delete the first 50 messages manually from only this server.
-	mset, _ := nsl.GlobalAccount().lookupStream("TEST")
-	if _, err := mset.purge(&JSApiStreamPurgeRequest{Sequence: 50}); err != nil {
-		t.Fatalf("Unexpected error: %v", err)
-	}
-
-	// Now shutdown.
-	nsl.Shutdown()
-	// make sure a leader exists
-	c.waitOnStreamLeader("$G", "TEST")
-
-	for i := 0; i < toSend; i++ {
-		if _, err := js.PublishAsync("foo", msg); err != nil {
-			t.Fatalf("Unexpected publish error: %v", err)
-		}
-	}
-	select {
-	case <-js.PublishAsyncComplete():
-	case <-time.After(5 * time.Second):
-		t.Fatalf("Did not receive completion signal")
-	}
-
-	// We need to snapshot to force upper layer catchup vs RAFT layer.
-	mset, err := c.streamLeader("$G", "TEST").GlobalAccount().lookupStream("TEST")
-	if err != nil {
-		t.Fatalf("Expected to find a stream for %q", "TEST")
-	}
-	if err := mset.raftNode().InstallSnapshot(mset.stateSnapshot()); err != nil {
-		t.Fatalf("Unexpected error: %v", err)
-	}
-
-	nsl = c.restartServer(nsl)
-	c.waitOnStreamCurrent(nsl, "$G", "TEST")
-
-	leaderState := mset.state()
-
-	checkFor(t, 5*time.Second, 100*time.Millisecond, func() error {
-		mset, _ = nsl.GlobalAccount().lookupStream("TEST")
-		cloneState := mset.state()
-
-		if reflect.DeepEqual(cloneState, leaderState) {
-			return nil
-		} else {
-			return fmt.Errorf("States do not match: %+v vs %+v", cloneState, leaderState)
-		}
-	})
-
 }
 
 // Issue #2666

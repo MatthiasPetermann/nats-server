@@ -14924,7 +14924,7 @@ func TestJetStreamPullConsumersOneShotBehavior(t *testing.T) {
 	}
 
 	noMsgs := &nats.Header{"Status": []string{"404"}, "Description": []string{"No Messages"}}
-	reqTimeout := &nats.Header{"Status": []string{"408"}, "Description": []string{"Request Timeout"}}
+	reqTimeout := &nats.Header{"Status": []string{"408"}, "Description": []string{"Request Timeout"}, "Nats-Pending-Bytes": []string{"0"}, "Nats-Pending-Messages": []string{"1"}}
 
 	// We are empty here, meaning no messages available.
 	// Do not wait, should get noMsgs.
@@ -15628,7 +15628,6 @@ func TestJetStreamPullConsumerHeartBeats(t *testing.T) {
 	// If HB larger than 50% of expires..
 	expectErr(doReq(1, 75*time.Millisecond, 100*time.Millisecond, 1))
 
-	reqTimeout := nats.Header{"Status": []string{"408"}, "Description": []string{"Request Timeout"}}
 	expectHBs := func(start time.Time, msgs []*tsMsg, expected int, hbi time.Duration) {
 		t.Helper()
 		if len(msgs) != expected {
@@ -15650,8 +15649,8 @@ func TestJetStreamPullConsumerHeartBeats(t *testing.T) {
 		}
 		// Last msg should be timeout.
 		lm := msgs[len(msgs)-1].msg
-		if !reflect.DeepEqual(lm.Header, reqTimeout) {
-			t.Fatalf("Expected %+v hdr, got %+v", reqTimeout, lm.Header)
+		if key := lm.Header.Get("Status"); key != "408" {
+			t.Fatalf("Expected 408 Request Timeout, got %s", key)
 		}
 	}
 
@@ -15676,8 +15675,8 @@ func TestJetStreamPullConsumerHeartBeats(t *testing.T) {
 	}
 	// Last should be timeout.
 	lm := msgs[len(msgs)-1].msg
-	if !reflect.DeepEqual(lm.Header, reqTimeout) {
-		t.Fatalf("Expected %+v hdr, got %+v", reqTimeout, lm.Header)
+	if key := lm.Header.Get("Status"); key != "408" {
+		t.Fatalf("Expected 408 Request Timeout, got %s", key)
 	}
 }
 
@@ -16868,11 +16867,19 @@ func TestJetStreamConsumerStreamUpdate(t *testing.T) {
 		_, err = js.AddStream(&nats.StreamConfig{Name: "foo", Duplicates: 1 * time.Minute, Replicas: replica})
 		defer js.DeleteStream("foo")
 		require_NoError(t, err)
+		// Update with no change
 		_, err = js.UpdateStream(&nats.StreamConfig{Name: "foo", Duplicates: 1 * time.Minute, Replicas: replica})
+		require_NoError(t, err)
+		// Update with change
+		_, err = js.UpdateStream(&nats.StreamConfig{Description: "stream", Name: "foo", Duplicates: 1 * time.Minute, Replicas: replica})
 		require_NoError(t, err)
 		_, err = js.AddConsumer("foo", &nats.ConsumerConfig{Durable: "dur1", AckPolicy: nats.AckExplicitPolicy})
 		require_NoError(t, err)
+		// Update with no change
 		_, err = js.UpdateConsumer("foo", &nats.ConsumerConfig{Durable: "dur1", AckPolicy: nats.AckExplicitPolicy})
+		require_NoError(t, err)
+		// Update with change
+		_, err = js.UpdateConsumer("foo", &nats.ConsumerConfig{Description: "consumer", Durable: "dur1", AckPolicy: nats.AckExplicitPolicy})
 		require_NoError(t, err)
 	}
 	t.Run("clustered", func(t *testing.T) {
@@ -17400,8 +17407,10 @@ func TestJetStreamPullMaxBytes(t *testing.T) {
 		if len(m.Data) != 0 {
 			t.Fatalf("Did not expect data, got %d bytes", len(m.Data))
 		}
-		if !reflect.DeepEqual(&m.Header, expected) {
-			t.Fatalf("Expected %+v hdr, got %+v", expected, m.Header)
+		expectedStatus, givenStatus := expected.Get("Status"), m.Header.Get("Status")
+		expectedDesc, givenDesc := expected.Get("Description"), m.Header.Get("Description")
+		if expectedStatus != givenStatus || expectedDesc != givenDesc {
+			t.Fatalf("expected  %s %s, got %s %s", expectedStatus, expectedDesc, givenStatus, givenDesc)
 		}
 	}
 
@@ -18099,79 +18108,6 @@ func TestJetStreamDirectMsgGetNext(t *testing.T) {
 	m = getMsg(14, "baz")
 	require_True(t, m.Header.Get(JSSequence) == "14")
 	require_True(t, m.Header.Get(JSSubject) == "baz")
-}
-
-func TestJetStreamConsumerInactiveThreshold(t *testing.T) {
-	s := RunBasicJetStreamServer()
-	if config := s.JetStreamConfig(); config != nil {
-		defer removeDir(t, config.StoreDir)
-	}
-	defer s.Shutdown()
-
-	nc, js := jsClientConnect(t, s)
-	defer nc.Close()
-
-	_, err := js.AddStream(&nats.StreamConfig{Name: "TEST", Subjects: []string{"foo"}})
-	require_NoError(t, err)
-
-	for i := 0; i < 10; i++ {
-		js.PublishAsync("foo", []byte("ok"))
-	}
-	select {
-	case <-js.PublishAsyncComplete():
-	case <-time.After(5 * time.Second):
-		t.Fatalf("Did not receive completion signal")
-	}
-
-	waitOnCleanup := func(ci *nats.ConsumerInfo) {
-		t.Helper()
-		checkFor(t, 2*time.Second, 50*time.Millisecond, func() error {
-			_, err := js.ConsumerInfo(ci.Stream, ci.Name)
-			if err == nil {
-				return fmt.Errorf("Consumer still present")
-			}
-			return nil
-		})
-	}
-
-	// Test to make sure inactive threshold is enforced for all types.
-	// Ephemeral and Durable, both push and pull.
-
-	// Ephemeral Push (no bind to deliver subject)
-	ci, err := js.AddConsumer("TEST", &nats.ConsumerConfig{
-		DeliverSubject:    "_no_bind_",
-		InactiveThreshold: 50 * time.Millisecond,
-	})
-	require_NoError(t, err)
-	waitOnCleanup(ci)
-
-	// Ephemeral Pull
-	ci, err = js.AddConsumer("TEST", &nats.ConsumerConfig{
-		AckPolicy:         nats.AckExplicitPolicy,
-		InactiveThreshold: 50 * time.Millisecond,
-	})
-	require_NoError(t, err)
-	waitOnCleanup(ci)
-
-	// Support InactiveThresholds for Durables as well.
-
-	// Durable Push (no bind to deliver subject)
-	ci, err = js.AddConsumer("TEST", &nats.ConsumerConfig{
-		Durable:           "d1",
-		DeliverSubject:    "_no_bind_",
-		InactiveThreshold: 50 * time.Millisecond,
-	})
-	require_NoError(t, err)
-	waitOnCleanup(ci)
-
-	// Durable Pull
-	ci, err = js.AddConsumer("TEST", &nats.ConsumerConfig{
-		Durable:           "d2",
-		AckPolicy:         nats.AckExplicitPolicy,
-		InactiveThreshold: 50 * time.Millisecond,
-	})
-	require_NoError(t, err)
-	waitOnCleanup(ci)
 }
 
 func TestJetStreamConsumerAndStreamNamesWithPathSeparators(t *testing.T) {
@@ -19642,5 +19578,106 @@ func TestJetStreamPullConsumerLastPerSubjectRedeliveries(t *testing.T) {
 			t.Fatalf("Expected message for subject foo.%v, got %v", i, m.Subject)
 		}
 		m.Ack()
+	}
+}
+
+func TestJetStreamPullConsumersTimeoutHeaders(t *testing.T) {
+	s := RunBasicJetStreamServer()
+	if config := s.JetStreamConfig(); config != nil {
+		defer removeDir(t, config.StoreDir)
+	}
+	defer s.Shutdown()
+
+	// Client for API requests.
+	nc, js := jsClientConnect(t, s)
+	defer nc.Close()
+
+	_, err := js.AddStream(&nats.StreamConfig{
+		Name:     "TEST",
+		Subjects: []string{"foo.>"},
+	})
+	require_NoError(t, err)
+
+	_, err = js.AddConsumer("TEST", &nats.ConsumerConfig{
+		Durable:   "dlc",
+		AckPolicy: nats.AckExplicitPolicy,
+	})
+	require_NoError(t, err)
+
+	nc.Publish("foo.foo", []byte("foo"))
+	nc.Publish("foo.bar", []byte("bar"))
+	nc.Publish("foo.else", []byte("baz"))
+	nc.Flush()
+
+	// We will do low level requests by hand for this test as to not depend on any client impl.
+	rsubj := fmt.Sprintf(JSApiRequestNextT, "TEST", "dlc")
+
+	maxBytes := 1024
+	batch := 50
+	req := &JSApiConsumerGetNextRequest{Batch: batch, Expires: 100 * time.Millisecond, NoWait: false, MaxBytes: maxBytes}
+	jreq, err := json.Marshal(req)
+	require_NoError(t, err)
+	// Create listener.
+	reply, msgs := nats.NewInbox(), make(chan *nats.Msg, batch)
+	sub, err := nc.ChanSubscribe(reply, msgs)
+	require_NoError(t, err)
+	defer sub.Unsubscribe()
+
+	// Send request.
+	err = nc.PublishRequest(rsubj, reply, jreq)
+	require_NoError(t, err)
+
+	bytesReceived := 0
+	messagesReceived := 0
+
+	checkHeaders := func(expectedStatus, expectedDesc string, m *nats.Msg) {
+		t.Helper()
+		if value := m.Header.Get("Status"); value != expectedStatus {
+			t.Fatalf("Expected status %q, got %q", expectedStatus, value)
+		}
+		if value := m.Header.Get("Description"); value != expectedDesc {
+			t.Fatalf("Expected description %q, got %q", expectedDesc, value)
+		}
+		if value := m.Header.Get(JSPullRequestPendingMsgs); value != fmt.Sprint(batch-messagesReceived) {
+			t.Fatalf("Expected %d messages, got %s", batch-messagesReceived, value)
+		}
+		if value := m.Header.Get(JSPullRequestPendingBytes); value != fmt.Sprint(maxBytes-bytesReceived) {
+			t.Fatalf("Expected %d bytes, got %s", maxBytes-bytesReceived, value)
+		}
+	}
+
+	for done := false; !done; {
+		select {
+		case m := <-msgs:
+			if len(m.Data) == 0 && m.Header != nil {
+				checkHeaders("408", "Request Timeout", m)
+				done = true
+			} else {
+				messagesReceived += 1
+				bytesReceived += (len(m.Data) + len(m.Header) + len(m.Reply) + len(m.Subject))
+			}
+		case <-time.After(100 + 250*time.Millisecond):
+			t.Fatalf("Did not receive all the msgs in time")
+		}
+	}
+
+	// Now resend the request but then shutdown the server and
+	// make sure we have the same info.
+	err = nc.PublishRequest(rsubj, reply, jreq)
+	require_NoError(t, err)
+	natsFlush(t, nc)
+
+	s.Shutdown()
+
+	// It is possible that the client did not receive, so let's not fail
+	// on that. But if the 409 indicating the the server is shutdown
+	// is received, then it should have the new headers.
+	messagesReceived, bytesReceived = 0, 0
+	select {
+	case m := <-msgs:
+		checkHeaders("409", "Server Shutdown", m)
+	case <-time.After(500 * time.Millisecond):
+		// we can't fail for that.
+		t.Logf("Subscription did not receive the pull request response on server shutdown")
 	}
 }
